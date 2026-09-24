@@ -1,0 +1,1884 @@
+---
+title: "Impact of HIV Infection, Immune Status, and Integrase Inhibitor-Based Antiretroviral Therapy on the Gut Microbiota in Men Who Have Sex with Men With and Without HIV"
+format:
+  html:
+    toc: true
+    code-fold: false
+    df-print: paged
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| output: false
+library(ANCOMBC)
+library(SummarizedExperiment)
+library(TreeSummarizedExperiment)
+library(ggpubr)
+library(ggrepel)
+library(phyloseq)
+library(vegan)
+library(ape)
+library(rstatix)
+library(tidyverse)
+```
+
+# Analysis overview
+
+This document reproduces the analyses used to characterize gut microbiota composition and predicted functional profiles in men who have sex with men (MSM) with and without HIV. The study design and participant characteristics are summarized in **Figure 1** and **Table 1** of the manuscript. The analyses evaluate HIV status, immune status, and exposure to integrase strand transfer inhibitor (INSTI)-based regimens.
+
+## Raw-read processing
+
+Raw sequencing reads are publicly available from the European Nucleotide Archive (ENA) under project accession **PRJEB84358** and therefore are not distributed with this repository. After downloading the reads, place them in `data/raw_reads/` before running the command below. Raw 16S rRNA gene sequencing reads were processed with the nf-core/ampliseq pipeline (version 2.9.0), using the SILVA 138 reference taxonomy and PICRUSt2 functional prediction as described in the manuscript.
+
+```{bash}
+#| eval: false
+nextflow run nf-core/ampliseq -r 2.9.0 -profile singularity --max_cpus 22 \
+    --input_folder "data/raw_reads" \
+    --FW_primer TACGGGNGGCWGCAG --RV_primer GACTACHVGGGTATCTAATCC \
+    --metadata "data/sample_metadata.tsv" \
+    --outdir "data/ampliseq_results" \
+    --trunclenf 270 --trunclenr 215 \
+    --vsearch_cluster \
+    --filter_ssu "bac" \
+    --qiime_ref_taxonomy silva=138 \
+    --metadata_category "group" \
+    --metadata_category_barplot "group" \
+    --picrust \
+    --diversity_rarefaction_depth 25000 \
+    --skip_dada_taxonomy \
+    --skip_dada_addspecies
+```
+
+## Analysis metadata
+
+The metadata are read once for the genus, KO, and EC analyses. The nf-core/ampliseq alpha-diversity outputs and phyloseq object already contain these columns, so their embedded metadata are used directly without an additional join. `ID` identifies each sample, `pid` identifies the participant, `timepoint` identifies the sampling period, `group` contains the group code, and `group_label` contains the corresponding manuscript label.
+
+```{r}
+metadata <- read_tsv("data/sample_metadata.tsv")
+
+group_levels <- c("prePEP_HIV-", "postPEP_HIV-",
+  "naive_HIV+", "shortART_HIV+", "longART_HIV+")
+
+group_label_levels <- c("prePEP", "postPEP",
+  "HIV+ lowCD4 preART", "HIV+ lowCD4 postART", "HIV+ highCD4 postART")
+
+timepoint_levels <- c("pre", "post")
+
+metadata <- metadata |>
+  mutate(
+    timepoint = factor(timepoint, levels = timepoint_levels),
+    group = factor(group, levels = group_levels))
+```
+
+# Helper functions
+
+The following functions prepare concise taxonomic and KEGG ortholog labels for figures and rendered result tables.
+
+## Function to clean taxon names
+
+```{r}
+clean_taxon_name <- function(x, add_rank = FALSE) {
+  bad_terms <- c("", NA, "__", "unclassified", "unknown", "metagenome")
+  
+  clean_one <- function(s) {
+    parts <- strsplit(s, ";", fixed = TRUE)[[1]]
+    parts <- trimws(parts)
+    
+    get_rank <- function(prefix) {
+      hit <- parts[grepl(paste0("^", prefix, "__"), parts)]
+      if (length(hit) == 0) return(NA_character_)
+      sub(paste0("^", prefix, "__"), "", hit[1])
+    }
+    
+    ranks <- c(
+      genus  = get_rank("g"),
+      family = get_rank("f"),
+      order  = get_rank("o"),
+      class  = get_rank("c"),
+      phylum = get_rank("p")
+    )
+    
+    is_bad <- function(z) {
+      is.na(z) || z %in% bad_terms || grepl("^_+$", z)
+    }
+    
+    clean_text <- function(z) {
+      z <- gsub("_", " ", z)
+      z <- gsub("\\[|\\]", "", z)
+      trimws(z)
+    }
+    
+    wrap_first_word <- function(z) {
+  parts <- strsplit(z, " ")[[1]]
+  if (length(parts) > 1) {
+    paste(c(parts[1], paste(parts[-1], collapse = " ")), collapse = "\n")
+  } else {
+    z
+  }
+}
+    
+    genus  <- ranks["genus"]
+    family <- ranks["family"]
+    
+    fallback_rank <- function() {
+      for (nm in c("family", "order", "class", "phylum")) {
+        if (!is_bad(ranks[nm]) && tolower(ranks[nm]) != "uncultured") {
+          return(list(value = unname(ranks[nm]), rank = nm))
+        }
+      }
+      list(value = "Unclassified Bacteria", rank = "none")
+    }
+    
+    # missing genus
+    if (is_bad(genus)) {
+      fb <- fallback_rank()
+      out <- clean_text(fb$value)
+      
+      if (add_rank && fb$rank != "none") {
+        out <- paste0(out, " (", fb$rank, ")")
+      }
+      return(wrap_first_word(out))
+    }
+    
+    genus_low <- tolower(genus)
+    
+    # genus explicitly uncultured
+    if (genus_low == "uncultured") {
+      fb <- fallback_rank()
+      return(wrap_first_word(paste0(clean_text(fb$value), " (uncultured)")))
+    }
+    
+    # placeholder/code-like genus names: prefix with family if available
+    placeholder_like <- grepl(
+      "^(UCG-[0-9A-Z]+|CAG-[0-9A-Z]+|DTU[0-9A-Z]+|RF39|TM7x|UBA[0-9]+|NK[0-9A-Z]+_group|NC[0-9A-Z]+_group|ND[0-9A-Z]+_group|FCS[0-9A-Z]+_group)$",
+      genus
+    )
+    
+    if (!is_bad(family) && placeholder_like) {
+      return(wrap_first_word(clean_text(paste(family, genus))))
+    }
+    
+    wrap_first_word(clean_text(genus))
+  }
+  
+  vapply(x, clean_one, character(1))
+}
+```
+
+## Function to clean KO names
+
+```{r}
+make_ko_label <- function(KO, description) {
+  x <- trimws(description)
+  
+  # Rule 1: hide uncharacterized proteins
+  if (grepl("uncharacterized protein", x, ignore.case = TRUE)) {
+    return(NA_character_)
+  }
+  
+  # Remove EC annotation at the end
+  x <- gsub("\\s*\\[EC:[^]]*\\]", "", x)
+  x <- trimws(x)
+  
+  # Keep only text before the first semicolon
+  left <- sub(";.*$", "", x)
+  left <- trimws(left)
+  
+  # Remove leading KO if present
+  left <- sub(paste0("^", KO, "\\s*"), "", left)
+  left <- trimws(left)
+  
+  # If nothing remains after removing KO, fall back to KO
+  if (left == "") {
+    return(KO)
+  }
+  
+  # Split aliases
+  aliases <- trimws(strsplit(left, ",", fixed = TRUE)[[1]])
+  aliases <- aliases[aliases != ""]
+  
+  # Filter out bad aliases
+  is_bad_alias <- function(a, KO) {
+    grepl("^E\\d+(\\.\\d+)*[A-Z]?$", a) ||      # EC-like token, e.g. E1.1.1.40 or E4.2.1.2A
+      grepl("^TC\\.", a) ||                     # TC.* code
+      grepl("^K\\d{5}$", a) ||                  # repeated KO
+      identical(a, KO)
+  }
+  
+  aliases <- aliases[!vapply(aliases, is_bad_alias, logical(1), KO = KO)]
+  
+  # If any usable alias remains, use the first one
+  if (length(aliases) > 0) {
+    return(aliases[1])
+  }
+  
+  # Otherwise use KO
+  KO
+}
+```
+
+## Functions for input validation and displayed results
+
+```{r}
+align_metadata <- function(feature_matrix, metadata) {
+  sample_ids <- colnames(feature_matrix)
+  metadata_index <- match(sample_ids, metadata[["ID"]])
+
+  if (anyNA(metadata_index)) {
+    stop("Some abundance-table samples are absent from the sample metadata.")
+  }
+
+  aligned_metadata <- metadata[metadata_index, , drop = FALSE]
+  stopifnot(identical(sample_ids, as.character(aligned_metadata[["ID"]])))
+  DataFrame(aligned_metadata)
+}
+
+extract_permanova <- function(result, comparison) {
+  tibble(
+    comparison = comparison,
+    R2 = result$R2[1],
+    p_value = result$`Pr(>F)`[1]
+  )
+}
+```
+
+
+# Alpha diversity
+
+Alpha diversity was evaluated using the number of observed amplicon sequence variants (ASVs) and the Shannon diversity index. Cross-sectional comparisons used the Kruskal–Wallis test followed by pairwise Mann–Whitney U tests with Benjamini–Hochberg correction, while longitudinal comparisons used paired Wilcoxon signed-rank tests (**Figure 2A–F**).
+
+```{r}
+colours_vector <- c("prePEP_HIV-" = "darkolivegreen1",
+                  "postPEP_HIV-" = "darkseagreen",
+                  "naive_HIV+" = "thistle1",
+                  "shortART_HIV+" = "lightpink1",
+                  "longART_HIV+" = "hotpink1")
+colours_vector_label <- c("prePEP" = "darkolivegreen1",
+                  "postPEP" = "darkseagreen",
+                  "HIV+ lowCD4 preART" = "thistle1",
+                  "HIV+ lowCD4 postART" = "lightpink1",
+                  "HIV+ highCD4 postART" = "hotpink1")
+```
+
+## Observed features
+
+```{r}
+obs <- read_tsv("data/alpha_observed_features.tsv", comment = "#") |>
+    dplyr::rename(ID = id) |> 
+    mutate(group = factor(group, levels = group_levels),
+           timepoint = factor(timepoint, levels = c("pre", "post")))
+```
+
+### Baseline groups (Figure 2A)
+
+Observed features were compared among the three independent baseline groups.
+
+```{r}
+# Subset data
+obs_baseline <- obs |> 
+    filter(timepoint == "pre" | group == "longART_HIV+") |> 
+    select(ID, group, timepoint, observed_features)
+# Check sample size per group
+obs_baseline |>
+  dplyr::count(group)
+```
+
+```{r}
+# Kruskal–Wallis test across baseline groups
+kw_obs <- obs_baseline |>
+  kruskal_test(observed_features ~ group)
+
+kw_obs
+```
+
+```{r}
+# Post-hoc pairwise Mann–Whitney if Kruskal–Wallis is significant
+pairwise_res <- pairwise.wilcox.test(
+  x = obs_baseline$observed_features,
+  g = obs_baseline$group,
+  p.adjust.method = "BH"
+)
+
+pairwise_obs_all <- as.data.frame(as.table(pairwise_res$p.value)) |>
+  dplyr::rename(group1 = Var1, group2 = Var2, p.adj = Freq) |>
+  filter(!is.na(p.adj)) |>
+  mutate(
+    label = ifelse(
+      p.adj < 0.001,
+      "p < 0.001",
+      paste0("p = ", sprintf("%.3f", p.adj))
+    )
+  )
+
+pairwise_obs_all |> select(group1, group2, p.adj)
+```
+
+```{r}
+ymax <- max(obs_baseline$observed_features, na.rm = TRUE)
+
+pairwise_res <- pairwise_obs_all |>
+  filter(p.adj < 0.05) |>
+  mutate(y.position = 400)
+```
+
+Graphics:
+
+```{r}
+pA1 <- obs_baseline |> 
+    ggplot(aes(x = group, y = observed_features, fill = group)) +
+  geom_violin(trim = FALSE) +
+  geom_dotplot(
+    binaxis = "y",
+    stackdir = "center",
+    dotsize = 0.5,
+    fill = "black",
+    alpha = 0.5
+  ) +
+  geom_boxplot(width = 0.1, alpha = 0.2, outlier.shape = NA) +
+  scale_fill_manual(values = colours_vector) +
+  scale_x_discrete(labels = c(
+    "prePEP_HIV-"  = "prePEP",
+    "naive_HIV+"    = "HIV+ lowCD4\npreART",
+    "longART_HIV+" = "HIV+ highCD4\npostART"
+  )) +
+  labs(
+    title = "Groups at baseline",
+    x = "",
+    y = "Observed features (ASVs)"
+  ) +
+  theme_bw() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5)) +
+  stat_compare_means(
+    method = "kruskal.test",
+    label.y = 425,
+    label.x = 0.75
+  ) +
+    stat_pvalue_manual(
+    pairwise_res,
+    label = "label",
+    tip.length = 0.01
+  )
+pA1
+```
+
+### Short-term PEP exposure (Figure 2B)
+
+Pre- and post-PEP samples were paired by participant before the Wilcoxon signed-rank test.
+
+```{r}
+obs_pep <- obs |>
+  filter(group %in% c("prePEP_HIV-", "postPEP_HIV-")) |>
+  select(pid, group, observed_features) |>
+  pivot_wider(names_from = group, values_from = observed_features) |>
+  drop_na()
+
+obs_pep_test <- wilcox.test(
+  obs_pep$`prePEP_HIV-`, obs_pep$`postPEP_HIV-`, paired = TRUE
+)
+tibble(comparison = "prePEP vs postPEP", n_pairs = nrow(obs_pep),
+       statistic = unname(obs_pep_test$statistic), p_value = obs_pep_test$p.value)
+```
+
+Graphics:
+
+```{r}
+pA2 <- obs |>
+    filter(group %in% c("prePEP_HIV-", "postPEP_HIV-")) |> 
+    ggplot(aes(x = group, y = observed_features, fill = group)) +
+  geom_violin(trim = FALSE) +
+  geom_dotplot(
+    binaxis = "y",
+    stackdir = "center",
+    dotsize = 0.75,
+    fill = "black",
+    alpha = 0.5
+  ) +
+  geom_boxplot(width = 0.1, alpha = 0.2, outlier.shape = NA) +
+  geom_line(aes(group = pid), alpha = 0.3) +
+  scale_fill_manual(values = colours_vector) +
+  scale_x_discrete(labels = c(
+    "prePEP_HIV-"  = "prePEP",
+    "postPEP_HIV-"  = "postPEP"
+  )) +
+  labs(
+    title = "PEP group",
+    x = "",
+    y = "Observed features (ASVs)"
+  ) +
+  theme_bw() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5))
+pA2
+```
+
+### ART initiation in participants with low CD4 counts (Figure 2C)
+
+Pre- and post-ART samples were paired by participant identifier.
+
+```{r}
+keep_pids_obs <- obs |>
+    filter(group %in% c("naive_HIV+", "shortART_HIV+")) |> 
+    dplyr::count(pid) |> 
+    filter(n == 2) |> 
+    pull(pid)
+
+obs_art <- obs |>
+    filter(group %in% c("naive_HIV+", "shortART_HIV+")) |>
+    filter(pid %in% keep_pids_obs) |>
+    select(pid, group, observed_features) |>
+    pivot_wider(names_from = group, values_from = observed_features) |>
+    drop_na()
+
+obs_art_test <- wilcox.test(
+  obs_art$`naive_HIV+`, obs_art$`shortART_HIV+`, paired = TRUE
+)
+tibble(comparison = "low-CD4 preART vs postART", n_pairs = nrow(obs_art),
+       statistic = unname(obs_art_test$statistic), p_value = obs_art_test$p.value)
+```
+
+Graphics:
+
+```{r}
+pA3 <- obs |>
+    filter(group %in% c("naive_HIV+", "shortART_HIV+")) |> 
+    filter(pid %in% keep_pids_obs) |> 
+    ggplot(aes(x = group, y = observed_features, fill = group)) +
+  geom_line(alpha = 0.3) +
+  geom_violin(trim = FALSE) +
+  geom_dotplot(
+    binaxis = "y",
+    stackdir = "center",
+    dotsize = 1,
+    fill = "black",
+    alpha = 0.5
+  ) +
+  geom_boxplot(width = 0.1, alpha = 0.2, outlier.shape = NA) +
+  geom_line(aes(group = pid), alpha = 0.3) +
+  scale_fill_manual(values = colours_vector) +
+  scale_x_discrete(labels = c(
+    "naive_HIV+"  = "preART",
+    "shortART_HIV+"  = "postART"
+  )) +
+  labs(
+    title = "HIV+ lowCD4 group",
+    x = "",
+    y = "Observed features (ASVs)"
+  ) +
+  theme_bw() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5))
+pA3
+```
+
+## Shannon diversity index
+
+```{r}
+shannon <- read_tsv("data/alpha_shannon.tsv", comment = "#") |>
+    dplyr::rename(ID = id) |> 
+    mutate(group = factor(group, levels = group_levels),
+           timepoint = factor(timepoint, levels = c("pre", "post")))
+```
+
+### Baseline groups (Figure 2D)
+
+Shannon diversity was compared among the three independent baseline groups.
+
+```{r}
+# Subset data
+shannon_baseline <- shannon |> 
+    filter(group %in% c("prePEP_HIV-", "naive_HIV+", "longART_HIV+")) |> 
+    select(ID, group, shannon_entropy)
+# Check sample size per group
+shannon_baseline |>
+  dplyr::count(group)
+```
+
+```{r}
+# Kruskal–Wallis test across baseline groups
+kw_shannon <- shannon_baseline |>
+  kruskal_test(shannon_entropy ~ group)
+
+kw_shannon
+```
+
+```{r}
+# Post-hoc pairwise Mann–Whitney if Kruskal–Wallis is significant
+pairwise_res <- pairwise.wilcox.test(
+  x = shannon_baseline$shannon_entropy,
+  g = shannon_baseline$group,
+  p.adjust.method = "BH"
+)
+
+pairwise_shannon_all <- as.data.frame(as.table(pairwise_res$p.value)) |>
+  dplyr::rename(group1 = Var1, group2 = Var2, p.adj = Freq) |>
+  filter(!is.na(p.adj)) |>
+  mutate(
+    label = ifelse(
+      p.adj < 0.001,
+      "p < 0.001",
+      paste0("p = ", sprintf("%.3f", p.adj))
+    )
+  )
+
+pairwise_shannon_all |> select(group1, group2, p.adj)
+```
+
+```{r}
+ymax <- max(shannon_baseline$shannon_entropy, na.rm = TRUE)
+
+pairwise_res <- pairwise_shannon_all |>
+  filter(p.adj < 0.05) |>
+  mutate(y.position = 7.6)
+```
+
+Graphics:
+
+```{r}
+pB1 <- shannon_baseline |> 
+    ggplot(aes(x = group, y = shannon_entropy, fill = group)) +
+  geom_violin(trim = FALSE) +
+  geom_dotplot(
+    binaxis = "y",
+    stackdir = "center",
+    dotsize = 0.5,
+    fill = "black",
+    alpha = 0.5
+  ) +
+  geom_boxplot(width = 0.1, alpha = 0.2, outlier.shape = NA) +
+  scale_fill_manual(values = colours_vector) +
+  scale_x_discrete(labels = c(
+    "prePEP_HIV-"  = "prePEP",
+    "naive_HIV+"    = "HIV+ lowCD4\npreART",
+    "longART_HIV+" = "HIV+ highCD4\npostART"
+  )) +
+  labs(
+    title = "Groups at baseline",
+    x = "",
+    y = "Shannon diversity"
+  ) +
+  theme_bw() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5)) +
+  stat_compare_means(
+    method = "kruskal.test",
+    label.y = 7.9,
+    label.x = 0.75
+  ) +
+    stat_pvalue_manual(
+    pairwise_res,
+    label = "label",
+    tip.length = 0.01
+  )
+pB1
+```
+
+### Short-term PEP exposure (Figure 2E)
+
+Pre- and post-PEP samples were paired by participant before the Wilcoxon signed-rank test.
+
+```{r}
+shannon_pep <- shannon |>
+  filter(group %in% c("prePEP_HIV-", "postPEP_HIV-")) |>
+  select(pid, group, shannon_entropy) |>
+  pivot_wider(names_from = group, values_from = shannon_entropy) |>
+  drop_na()
+
+shannon_pep_test <- wilcox.test(
+  shannon_pep$`prePEP_HIV-`, shannon_pep$`postPEP_HIV-`, paired = TRUE
+)
+tibble(comparison = "prePEP vs postPEP", n_pairs = nrow(shannon_pep),
+       statistic = unname(shannon_pep_test$statistic), p_value = shannon_pep_test$p.value)
+```
+
+Graphics:
+
+```{r}
+pB2 <- shannon |>
+    filter(group %in% c("prePEP_HIV-", "postPEP_HIV-")) |> 
+    ggplot(aes(x = group, y = shannon_entropy, fill = group)) +
+  geom_violin(trim = FALSE) +
+  geom_dotplot(
+    binaxis = "y",
+    stackdir = "center",
+    dotsize = 0.75,
+    fill = "black",
+    alpha = 0.5
+  ) +
+  geom_boxplot(width = 0.1, alpha = 0.2, outlier.shape = NA) +
+  geom_line(aes(group = pid), alpha = 0.3) +
+  scale_fill_manual(values = colours_vector) +
+  scale_x_discrete(labels = c(
+    "prePEP_HIV-"  = "prePEP",
+    "postPEP_HIV-"  = "postPEP"
+  )) +
+  labs(
+    title = "PEP group",
+    x = "",
+    y = "Shannon diversity"
+  ) +
+  theme_bw() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5))
+pB2
+```
+
+### ART initiation in participants with low CD4 counts (Figure 2F)
+
+Pre- and post-ART samples were paired by participant identifier.
+
+```{r}
+keep_pids_shannon <- shannon |>
+    filter(group %in% c("naive_HIV+", "shortART_HIV+")) |> 
+    dplyr::count(pid) |> 
+    filter(n == 2) |> 
+    pull(pid)
+
+shannon_art <- shannon |>
+    filter(group %in% c("naive_HIV+", "shortART_HIV+")) |>
+    filter(pid %in% keep_pids_shannon) |>
+    select(pid, group, shannon_entropy) |>
+    pivot_wider(names_from = group, values_from = shannon_entropy) |>
+    drop_na()
+
+shannon_art_test <- wilcox.test(
+  shannon_art$`naive_HIV+`, shannon_art$`shortART_HIV+`, paired = TRUE
+)
+tibble(comparison = "low-CD4 preART vs postART",
+       n_pairs = nrow(shannon_art),
+       statistic = unname(shannon_art_test$statistic), 
+       p_value = shannon_art_test$p.value)
+```
+
+Graphics:
+
+```{r}
+pB3 <- shannon |>
+    filter(group %in% c("naive_HIV+", "shortART_HIV+")) |> 
+    filter(pid %in% keep_pids_shannon) |> 
+    ggplot(aes(x = group, y = shannon_entropy, fill = group)) +
+  geom_violin(trim = FALSE) +
+  geom_dotplot(
+    binaxis = "y",
+    stackdir = "center",
+    dotsize = 1,
+    fill = "black",
+    alpha = 0.5
+  ) +
+  geom_boxplot(width = 0.1, alpha = 0.2, outlier.shape = NA) +
+  geom_line(aes(group = pid), alpha = 0.3) +
+  scale_fill_manual(values = colours_vector) +
+  scale_x_discrete(labels = c(
+    "naive_HIV+"  = "preART",
+    "shortART_HIV+"  = "postART"
+  )) +
+  labs(
+    title = "HIV+ lowCD4 group",
+    x = "",
+    y = "Shannon diversity"
+  ) +
+  theme_bw() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5))
+pB3
+```
+
+## Final figure (alpha diversity)
+
+```{r}
+# svg("figures/alpha_diversity.svg", width = 10.5, height = 7.5)
+ggpubr::ggarrange(
+    pA1, pA2, pA3, pB1, pB2, pB3,
+    ncol = 3, nrow = 2,
+    widths = c(1.5, 1, 1),
+    labels = c("A", "B", "C", "D", "E", "F")
+)
+# dev.off()
+```
+
+
+# Beta diversity
+
+Beta diversity was assessed using principal coordinate analysis (PCoA) of weighted UniFrac distances. Between-group comparisons used PERMANOVA with 10,000 permutations. Longitudinal comparisons restricted permutations within participants to account for paired sampling (**Figure 3A–E**).
+
+```{r}
+# Load phyloseq data
+physeq_data <- readRDS("data/qiime2_phyloseq.rds")
+
+sample_data(physeq_data)$timepoint <- factor(
+  sample_data(physeq_data)$timepoint,
+  levels = timepoint_levels)
+sample_data(physeq_data)$group <- factor(
+  sample_data(physeq_data)$group,
+  levels = group_levels)
+sample_data(physeq_data)$group_label <- factor(
+  sample_data(physeq_data)$group_label,
+  levels = group_label_levels)
+
+# Read tree
+tree_data <- read.tree("data/phylogenetic_tree.nwk")
+# Add tree
+physeq_data_tree <- merge_phyloseq(physeq_data, tree_data)
+```
+
+Statistics:
+
+```{r}
+sam <- data.frame(sample_data(physeq_data_tree))
+sam
+```
+
+## Weighted Unifrac
+
+```{r}
+wunifrac <- ordinate(physeq = physeq_data_tree, method = "PCoA", distance = "wunifrac")
+pco1_var <- round(wunifrac$values$Relative_eig[1] * 100, 1)
+pco2_var <- round(wunifrac$values$Relative_eig[2] * 100, 1)
+wunifrac_df <- data.frame(wunifrac$vectors) |>
+    select(Axis.1, Axis.2) |> 
+    mutate(group_label = sample_data(physeq_data_tree)$group_label)
+```
+
+### All study groups (Figure 3A)
+
+The global ordination displays all study groups.
+
+```{r}
+f2A <- wunifrac_df |> ggplot(aes(x = Axis.1, y = Axis.2, fill = group_label, colour = group_label)) +
+    geom_point(shape = 21, colour = "black", stroke = 0.3) +
+    stat_ellipse() +
+    scale_fill_manual(values = colours_vector_label) +
+    scale_colour_manual(values = colours_vector_label) +
+    labs (title = "PCoA of all groups",
+          x = paste0("PCo 1 (", pco1_var, "%)"),
+          y = paste0("PCo 2 (", pco2_var, "%)"),
+          fill = "", colour = "") +
+    theme_bw() +
+    theme(legend.position = "bottom",
+          legend.box.background = element_rect(color = "black"),
+          plot.title = element_text(hjust = 0.5)) +
+    guides(fill = guide_legend(nrow = 2))
+f2A
+```
+
+### HIV status (Figure 3B)
+
+HIV-negative participants before PEP were compared with ART-naive participants with HIV and low CD4 counts.
+
+```{r}
+physeq_data_tree_f2B <- subset_samples(physeq_data_tree,
+                                       group_label %in% c("prePEP",
+                                                    "HIV+ lowCD4 preART"))
+                                       
+wunifrac_f2B <- ordinate(physeq = physeq_data_tree_f2B, method = "PCoA", distance = "wunifrac")
+
+pco1_var_f2B <- round(wunifrac_f2B$values$Relative_eig[1] * 100, 1)
+pco2_var_f2B <- round(wunifrac_f2B$values$Relative_eig[2] * 100, 1)
+
+wunifrac_df_f2B <- data.frame(wunifrac_f2B$vectors) |>
+    select(Axis.1, Axis.2) |>
+    mutate(group_label = sample_data(physeq_data_tree_f2B)$group_label)
+
+f2B <- wunifrac_df_f2B |> ggplot(aes(x = Axis.1, y = Axis.2, fill = group_label, colour = group_label)) +
+    geom_point(shape = 21, colour = "black", stroke = 0.3) +
+    stat_ellipse() +
+    scale_fill_manual(values = colours_vector_label) +
+    scale_colour_manual(values = colours_vector_label) +
+    labs (title = "HIV infection",
+          x = paste0("PCo 1 (", pco1_var_f2B, "%)"),
+          y = paste0("PCo 2 (", pco2_var_f2B, "%)"),
+          fill = "", colour = "") +
+    theme_bw() +
+    theme(legend.position = "none",
+          plot.title = element_text(hjust = 0.5)) +
+    annotate("text", x = -Inf, y = -Inf, 
+         label = "PERMANOVA, p < 0.0002", 
+         hjust = -0.1, vjust = -0.5,
+         size = 3) +
+    scale_y_continuous(expand = expansion(mult = c(0.15, 0.05)))
+f2B
+```
+Statistics:
+
+```{r}
+sam_f2B <- data.frame(sample_data(physeq_data_tree_f2B))
+wunifrac_dist_f2B <- phyloseq::distance(physeq_data_tree_f2B, method = "wunifrac")
+permanova_f2B <- adonis2(wunifrac_dist_f2B ~ group_label, data = sam_f2B, permutations = 10000)
+permanova_f2B
+```
+
+### Immune status (Figure 3C)
+
+Participants with HIV and low CD4 counts after ART were compared with participants with HIV and high CD4 counts receiving ART.
+
+```{r}
+physeq_data_tree_f2C <- subset_samples(physeq_data_tree,
+                                       group_label %in% c("HIV+ lowCD4 postART",
+                                                    "HIV+ highCD4 postART"))
+                                       
+wunifrac_f2C <- ordinate(physeq = physeq_data_tree_f2C, method = "PCoA", distance = "wunifrac")
+
+pco1_var_f2C <- round(wunifrac_f2C$values$Relative_eig[1] * 100, 1)
+pco2_var_f2C <- round(wunifrac_f2C$values$Relative_eig[2] * 100, 1)
+
+wunifrac_df_f2C <- data.frame(wunifrac_f2C$vectors) |>
+    select(Axis.1, Axis.2) |>
+    mutate(group_label = sample_data(physeq_data_tree_f2C)$group_label)
+
+f2C <- wunifrac_df_f2C |> ggplot(aes(x = Axis.1, y = Axis.2, fill = group_label, colour = group_label)) +
+    geom_point(shape = 21, colour = "black", stroke = 0.3) +
+    stat_ellipse() +
+    scale_fill_manual(values = colours_vector_label) +
+    scale_colour_manual(values = colours_vector_label) +
+    labs (title = "Immune status",
+          x = paste0("PCo 1 (", pco1_var_f2C, "%)"),
+          y = paste0("PCo 2 (", pco2_var_f2C, "%)"),
+          fill = "", colour = "") +
+    theme_bw() +
+    theme(legend.position = "none",
+          plot.title = element_text(hjust = 0.5)) +
+    annotate("text", x = -Inf, y = -Inf, 
+         label = "PERMANOVA, p < 0.05", 
+         hjust = -0.1, vjust = -0.5,
+         size = 3) +
+    scale_y_continuous(expand = expansion(mult = c(0.15, 0.05)))
+f2C
+```
+
+Statistics:
+```{r}
+sam_f2C <- data.frame(sample_data(physeq_data_tree_f2C))
+wunifrac_dist_f2C <- phyloseq::distance(physeq_data_tree_f2C, method = "wunifrac")
+permanova_f2C <- adonis2(wunifrac_dist_f2C ~ group_label, data = sam_f2C, permutations = 10000)
+permanova_f2C
+```
+
+### Short-term PEP exposure (Figure 3D)
+
+The paired comparison evaluates changes from pre-PEP to post-PEP in HIV-negative participants.
+
+```{r}
+physeq_data_tree_f2D <- subset_samples(physeq_data_tree,
+                                       group_label %in% c("prePEP",
+                                                    "postPEP"))
+                                       
+wunifrac_f2D <- ordinate(physeq = physeq_data_tree_f2D, method = "PCoA", distance = "wunifrac")
+
+pco1_var_f2D <- round(wunifrac_f2D$values$Relative_eig[1] * 100, 1)
+pco2_var_f2D <- round(wunifrac_f2D$values$Relative_eig[2] * 100, 1)
+
+wunifrac_df_f2D <- data.frame(wunifrac_f2D$vectors) |>
+    select(Axis.1, Axis.2) |>
+    mutate(group_label = sample_data(physeq_data_tree_f2D)$group_label,
+           pid = sample_data(physeq_data_tree_f2D)$pid,
+           timepoint = sample_data(physeq_data_tree_f2D)$timepoint)
+
+f2D <- wunifrac_df_f2D |> arrange(pid, timepoint) |> 
+    ggplot(aes(x = Axis.1, y = Axis.2, fill = group_label, colour = group_label)) +
+    geom_path(aes(group = pid), colour = "grey50", linewidth = 0.3,
+              arrow = arrow(length = unit(0.2, "cm"), type = "open")) +
+    geom_point(shape = 21, colour = "black", stroke = 0.3) +
+    stat_ellipse() +
+    scale_fill_manual(values = colours_vector_label) +
+    scale_colour_manual(values = colours_vector_label) +
+    labs (title = "PEP exposure",
+          x = paste0("PCo 1 (", pco1_var_f2D, "%)"),
+          y = paste0("PCo 2 (", pco2_var_f2D, "%)"),
+          fill = "", colour = "") +
+    theme_bw() +
+    theme(legend.position = "none",
+          plot.title = element_text(hjust = 0.5))
+f2D
+```
+
+Statistics:
+```{r}
+sam_f2D <- data.frame(sample_data(physeq_data_tree_f2D))
+wunifrac_dist_f2D <- phyloseq::distance(physeq_data_tree_f2D, method = "wunifrac")
+permanova_f2D <- with(sam_f2D, adonis2(wunifrac_dist_f2D ~ group_label, 
+                 data = sam_f2D, permutations = 10000, strata = pid))
+permanova_f2D
+```
+
+### ART initiation in participants with low CD4 counts (Figure 3E)
+
+The paired comparison evaluates samples collected before and after ART initiation.
+
+```{r}
+paired_pids_f2E <- data.frame(sample_data(physeq_data_tree)) |>
+  filter(group_label %in% c("HIV+ lowCD4 preART", "HIV+ lowCD4 postART")) |>
+  dplyr::count(pid) |>
+  filter(n == 2) |>
+  pull(pid)
+
+physeq_data_tree_f2E <- subset_samples(physeq_data_tree,
+                                       group_label %in% c("HIV+ lowCD4 preART",
+                                                    "HIV+ lowCD4 postART") & pid %in% paired_pids_f2E)
+                                       
+wunifrac_f2E <- ordinate(physeq = physeq_data_tree_f2E, method = "PCoA", distance = "wunifrac")
+
+pco1_var_f2E <- round(wunifrac_f2E$values$Relative_eig[1] * 100, 1)
+pco2_var_f2E <- round(wunifrac_f2E$values$Relative_eig[2] * 100, 1)
+
+wunifrac_df_f2E <- data.frame(wunifrac_f2E$vectors) |>
+    select(Axis.1, Axis.2) |>
+    mutate(group_label = sample_data(physeq_data_tree_f2E)$group_label,
+           pid = sample_data(physeq_data_tree_f2E)$pid,
+           timepoint = sample_data(physeq_data_tree_f2E)$timepoint)
+
+f2E <- wunifrac_df_f2E |> arrange(pid, timepoint) |> 
+    ggplot(aes(x = Axis.1, y = Axis.2, fill = group_label, colour = group_label)) +
+    geom_path(aes(group = pid), colour = "grey50", linewidth = 0.3,
+              arrow = arrow(length = unit(0.2, "cm"), type = "open")) +
+    geom_point(shape = 21, colour = "black", stroke = 0.3) +
+    stat_ellipse() +
+    scale_fill_manual(values = colours_vector_label) +
+    scale_colour_manual(values = colours_vector_label) +
+    labs (title = "ART exposure in HIV+",
+          x = paste0("PCo 1 (", pco1_var_f2E, "%)"),
+          y = paste0("PCo 2 (", pco2_var_f2E, "%)"),
+          fill = "", colour = "") +
+    theme_bw() +
+    theme(legend.position = "none",
+          plot.title = element_text(hjust = 0.5))
+f2E
+```
+
+Statistics:
+```{r}
+sam_f2E <- data.frame(sample_data(physeq_data_tree_f2E))
+wunifrac_dist_f2E <- phyloseq::distance(physeq_data_tree_f2E, method = "wunifrac")
+permanova_f2E <- with(sam_f2E, adonis2(wunifrac_dist_f2E ~ group_label, data = sam_f2E,
+                                       permutations = 10000, strata = pid))
+permanova_f2E
+```
+
+The PERMANOVA results shown below correspond to the comparisons presented in **Figure 3A–E**.
+
+```{r}
+bind_rows(
+  extract_permanova(permanova_f2B, "HIV status"),
+  extract_permanova(permanova_f2C, "Immune status"),
+  extract_permanova(permanova_f2D, "PEP exposure"),
+  extract_permanova(permanova_f2E, "ART initiation in low-CD4 participants")
+)
+```
+
+### Final figure (beta diversity)
+
+```{r}
+# svg("figures/beta_diversity.svg", width = 10.5, height = 5.25)
+right_panel <- ggpubr::ggarrange(
+    f2B, f2C, f2D, f2E,
+    ncol = 2, nrow = 2,
+    labels = c("B", "C", "D", "E")
+)
+
+ggpubr::ggarrange(
+    f2A, right_panel,
+    ncol = 2,
+    labels = c("A", "")
+)
+# dev.off()
+```
+
+
+# Differential taxonomic abundance
+
+Genus-level absolute abundance tables were analyzed with ANCOM-BC2. The three targeted comparisons evaluated HIV status, immune status after ART, and short-term PEP exposure. Complete model results can optionally be exported, while significant taxa are displayed in the rendered document (**Figure 4A–C, Supplementary Tables 1–3**).
+
+## ANCOMBC-2
+
+Build a TreeSummarizedExperiment:
+
+```{r}
+# Read abundance table
+abundance_table_g <- read_tsv("data/genus_absolute_abundance.tsv", skip = 1)
+# Create microbial count table
+abundance_mat <- as.matrix(abundance_table_g[, -1])
+rownames(abundance_mat) <- abundance_table_g$`#OTU ID`
+relabundance_table_g <- read_tsv("data/genus_relative_abundance.tsv", skip = 1)
+relabundance_mat <- as.matrix(relabundance_table_g[, -1])
+rownames(relabundance_mat) <- relabundance_table_g$`#OTU ID`
+relabundance_mat <- relabundance_mat[, colnames(abundance_mat), drop = FALSE]
+assays <- SimpleList(counts = abundance_mat,
+                     relcounts = relabundance_mat)
+```
+
+```{r}
+# Create metadata table
+smd <- align_metadata(abundance_mat, metadata)
+```
+
+Create TSE:
+
+```{r}
+tse <- TreeSummarizedExperiment(assays = assays,
+                                colData = smd,
+                                rowData = NULL)
+```
+
+## HIV status (Figure 4A, Supplementary Table 1)
+
+Create tse by filtering previous tse:
+
+```{r}
+# QUESTION: Differences between HIV infection status
+tse_HIV <- tse[, colData(tse)$group %in% c("prePEP_HIV-", "naive_HIV+")]
+colData(tse_HIV)$group = factor(colData(tse_HIV)$group, levels = c("prePEP_HIV-", "naive_HIV+"))
+# Run ANCOMBC2
+results_HIV <- ancombc2(tse_HIV, fix_formula = "group")
+res_prim_HIV <- results_HIV$res
+# write_tsv(res_prim_HIV, "tables/taxa_hiv_status.tsv")
+```
+
+### Volcano plot
+
+```{r}
+res_prim_HIV$taxon_label <- clean_taxon_name(res_prim_HIV$taxon)
+
+res_prim_HIV |>
+  filter(`q_groupnaive_HIV+` < 0.05) |>
+  mutate(taxon = gsub("\\n", " ", taxon_label),
+            log_fold_change = `lfc_groupnaive_HIV+`,
+            q_value = `q_groupnaive_HIV+`, .keep = "none") |>
+  arrange(q_value)
+```
+
+```{r}
+volc_HIV <- res_prim_HIV |> 
+  mutate(
+    logFC = `lfc_groupnaive_HIV+`,
+    qval  = `q_groupnaive_HIV+`,
+    neglog10q = -log10(qval),
+    direction = case_when(
+      qval < 0.05 & logFC > 0 ~ "Up",
+      qval < 0.05 & logFC < 0 ~ "Down",
+      TRUE ~ "n.s."
+    )
+  )
+```
+
+```{r}
+f3A <- ggplot(volc_HIV, aes(x = logFC, y = neglog10q)) +
+    geom_point(aes(color = direction), alpha = 0.7) +
+    
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    
+    geom_text_repel(
+        data = subset(volc_HIV, qval < 0.05),
+        aes(label = taxon_label),
+        size = 3,
+        max.overlaps = Inf,
+        force = 25,
+        force_pull = 0.5,
+        segment.color = "grey50",
+        segment.size = 0.3,
+        min.segment.length = 0.1,
+        box.padding = 0.4,
+        point.padding = 0.2,
+        lineheight = 0.75
+    ) +
+    
+    scale_color_manual(values = c("Down" = "blue", "n.s." = "grey70", "Up" = "red")) +
+    
+    theme_bw() +
+    labs(
+        x = "Log Fold Change",
+        y = "-log10(q-value)",
+        color = "Direction",
+        title = "HIV infection\n(prePEP and HIV+ lowCD4 preART)"
+    ) +
+    theme(plot.title = element_text(hjust = 0.5))
+f3A
+```
+
+
+## Short-term PEP exposure (Figure 4C, Supplementary Table 3)
+
+```{r}
+tse_ART <- tse[, colData(tse)$group %in% c("prePEP_HIV-", "postPEP_HIV-")]
+colData(tse_ART)$group = factor(colData(tse_ART)$group, levels = c("prePEP_HIV-", "postPEP_HIV-"))
+# Run ANCOMBC2
+results_ART <- ancombc2(tse_ART, fix_formula = "group")
+res_prim_ART <- results_ART$res
+# write_tsv(res_prim_ART, "tables/taxa_pep_exposure.tsv")
+```
+
+### Volcano plot
+
+```{r}
+res_prim_ART$taxon_label <- clean_taxon_name(res_prim_ART$taxon)
+
+res_prim_ART |>
+  filter(`q_grouppostPEP_HIV-` < 0.05) |>
+  mutate(taxon = gsub("\\n", " ", taxon_label),
+            log_fold_change = `lfc_grouppostPEP_HIV-`,
+            q_value = `q_grouppostPEP_HIV-`, .keep = "none") |>
+  arrange(q_value)
+```
+
+```{r}
+volc_ART <- res_prim_ART |>
+  mutate(
+    logFC = `lfc_grouppostPEP_HIV-`,
+    qval  = `q_grouppostPEP_HIV-`,
+    neglog10q = -log10(qval),
+    direction = case_when(
+      qval < 0.05 & logFC > 0 ~ "Up",
+      qval < 0.05 & logFC < 0 ~ "Down",
+      TRUE ~ "n.s."
+    )
+  )
+```
+
+```{r}
+f3C <- ggplot(volc_ART, aes(x = logFC, y = neglog10q)) +
+    geom_point(aes(color = direction), alpha = 0.7) +
+    
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    
+    geom_text_repel(
+        data = subset(volc_ART, qval < 0.05),
+        aes(label = taxon_label),
+        size = 3,
+        max.overlaps = Inf,
+        force = 2,
+        force_pull = 0.5,
+        segment.color = "grey50",
+        segment.size = 0.3,
+        box.padding = 0.4,
+        point.padding = 0.2
+    ) +
+    
+    scale_color_manual(values = c("Down" = "blue", "n.s." = "grey70", "Up" = "red")) +
+
+    theme_bw() +
+    labs(
+        x = "Log Fold Change",
+        y = "-log10(q-value)",
+        color = "Direction",
+        title = "PEP exposure\n(prePEP and postPEP)"
+    ) +
+    theme(legend.position = "none",
+          plot.title = element_text(size = 10, hjust = 0.5))
+f3C
+```
+
+
+## Immune status (Figure 4B, Supplementary Table 2)
+
+```{r}
+tse_immuno <- tse[, colData(tse)$group %in% c("shortART_HIV+", "longART_HIV+")]
+colData(tse_immuno)$group = factor(colData(tse_immuno)$group, levels = c("shortART_HIV+", "longART_HIV+"))
+# Run ANCOMBC2
+results_immuno <- ancombc2(tse_immuno, fix_formula = "group")
+res_prim_immuno <- results_immuno$res
+# write_tsv(res_prim_immuno, "tables/taxa_immune_status.tsv")
+```
+
+### Volcano plot
+
+```{r}
+res_prim_immuno$taxon_label <- clean_taxon_name(res_prim_immuno$taxon)
+
+res_prim_immuno |>
+  filter(`q_grouplongART_HIV+` < 0.05) |>
+  mutate(taxon = gsub("\\n", " ", taxon_label),
+            log_fold_change = `lfc_grouplongART_HIV+`,
+            q_value = `q_grouplongART_HIV+`, .keep = "none") |>
+  arrange(q_value)
+```
+
+```{r}
+volc_immuno <- res_prim_immuno |>
+  mutate(
+    logFC = `lfc_grouplongART_HIV+`,
+    qval  = `q_grouplongART_HIV+`,
+    neglog10q = -log10(qval),
+    direction = case_when(
+      qval < 0.05 & logFC > 0 ~ "Up",
+      qval < 0.05 & logFC < 0 ~ "Down",
+      TRUE ~ "n.s."
+    )
+  )
+```
+
+```{r}
+f3B <- ggplot(volc_immuno, aes(x = logFC, y = neglog10q)) +
+    geom_point(aes(color = direction), alpha = 0.7) +
+    
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    
+    geom_text_repel(
+        data = subset(volc_immuno, qval < 0.05),
+        aes(label = taxon_label),
+        size = 3,
+        max.overlaps = Inf,
+        force = 2,
+        force_pull = 0.5,
+        segment.color = "grey50",
+        segment.size = 0.3,
+        box.padding = 0.4,
+        point.padding = 0.2,
+        lineheight = 0.75
+    ) +
+    
+    scale_color_manual(values = c("Down" = "blue", "n.s." = "grey70", "Up" = "red")) +
+    
+    theme_bw() +
+    labs(
+        x = "Log Fold Change",
+        y = "-log10(q-value)",
+        color = "Direction",
+        title = "Immune status\n(HIV+ lowCD4 postART and\nHIV+ highCD4 postART)"
+    ) +
+    theme(legend.position = "none",
+          plot.title = element_text(size = 10, hjust = 0.5))
+f3B
+```
+
+## Final figure (differential abundance analyis)
+
+```{r}
+# svg("figures/differential_taxa.svg", width = 10.5, height = 7.5)
+
+y_lim <- ggplot_build(f3A)$layout$panel_params[[1]]$y.range
+f3Ay <- f3A + coord_cartesian(ylim = y_lim)
+f3By <- f3B + coord_cartesian(ylim = y_lim)
+f3Cy <- f3C + coord_cartesian(ylim = y_lim)
+
+right <- ggpubr::ggarrange(
+    f3By, f3Cy,
+    ncol = 1,
+    labels = c("B", "C")
+)
+
+ggpubr::ggarrange(
+    f3Ay, right,
+    ncol = 2,
+    widths = c(2.5, 1),   # A wider than B/C column
+    labels = c("A", ""), 
+    common.legend = TRUE,
+    legend = "bottom"
+)
+
+# dev.off()
+```
+
+# Predicted functional profiles
+
+PICRUSt2-predicted absolute abundances of KEGG orthologs (KO) and Enzyme Classification (EC) terms were analyzed with ANCOM-BC2. Complete results remain available through optional TSV exports. To keep the HTML concise, rendered tables include significant terms with an absolute log fold change of at least 2 (**Figure 5A–F, Supplementary Tables 4–9**).
+
+## KEGG orthologs (KO terms)
+
+Build a TreeSummarizedExperiment:
+
+```{r}
+# Read abundance table
+KO_table <- read_tsv("data/picrust2_ko_abundance.tsv") |>
+    dplyr::rename(KO = `function`)
+# Create microbial count table
+KO_mat <- as.matrix(KO_table[, c(-1, -2)])
+rownames(KO_mat) <- KO_table$KO
+KO_assays <- SimpleList(counts = KO_mat)
+```
+
+```{r}
+# Create metadata table
+smd <- align_metadata(KO_mat, metadata)
+```
+
+Create TSE:
+
+```{r}
+KO_tse <- TreeSummarizedExperiment(assays = KO_assays,
+                                   colData = smd,
+                                   rowData = NULL)
+```
+
+### HIV status (Figure 5A, Supplementary Table 4)
+
+Create tse by filtering previous tse:
+
+```{r}
+# QUESTION: Differences between HIV infection status
+KO_tse_HIV <- KO_tse[, colData(KO_tse)$group %in% c("prePEP_HIV-", "naive_HIV+")]
+colData(KO_tse_HIV)$group = factor(colData(KO_tse_HIV)$group, levels = c("prePEP_HIV-", "naive_HIV+"))
+# Remove zero variance KOs
+drop_kos <- c("K00187", "K00188", "K01563", "K02756", "K09744",
+              "K10353", "K11176", "K11540", "K14439", "K13714",
+              "K18295", "K18481")
+KO_tse_HIV <- KO_tse_HIV[!rownames(KO_tse_HIV) %in% drop_kos, ]
+# Run ANCOMBC2
+KO_results_HIV <- ancombc2(KO_tse_HIV, fix_formula = "group")
+KO_res_prim_HIV <- KO_results_HIV$res
+KO_res_prim_HIV <- KO_res_prim_HIV |>
+    dplyr::left_join(KO_table[, c("KO", "description")], by = c("taxon" = "KO")) |>
+    relocate(taxon, description) |> 
+    rename(KO = taxon)
+# write_tsv(KO_res_prim_HIV, "tables/ko_hiv_status.tsv")
+```
+
+The concise table below shows the significant KO terms with $|LFC| \geq 2$. The optional TSV export retains the complete ANCOM-BC2 result, including terms with q-values above 0.05.
+
+```{r}
+KO_res_prim_HIV |>
+  filter(`q_groupnaive_HIV+` < 0.05, abs(`lfc_groupnaive_HIV+`) >= 2) |>
+  mutate(KO, description, log_fold_change = `lfc_groupnaive_HIV+`,
+            q_value = `q_groupnaive_HIV+`, .keep = "none") |>
+  arrange(q_value)
+```
+
+#### Volcano plot
+
+```{r}
+KO_res_prim_HIV$plot_label <- mapply(make_ko_label, KO_res_prim_HIV$KO, KO_res_prim_HIV$description)
+```
+
+```{r}
+volc_KO_HIV <- KO_res_prim_HIV |>
+  mutate(
+    logFC = `lfc_groupnaive_HIV+`,
+    qval  = `q_groupnaive_HIV+`,
+    neglog10q = -log10(qval),
+    direction = case_when(
+      qval < 0.05 & logFC > 0 ~ "Up",
+      qval < 0.05 & logFC < 0 ~ "Down",
+      TRUE ~ "n.s."
+    )
+  )
+# Filter because there are too many
+# Get top 10 and bottom 10 indices
+sig_idx <- which(volc_KO_HIV$qval < 0.05 & !is.na(volc_KO_HIV$plot_label))
+
+sig_logFC <- volc_KO_HIV$logFC[sig_idx]
+
+top_sig_idx <- sig_idx[order(sig_logFC, decreasing = TRUE)[1:min(5, length(sig_idx))]]
+bottom_sig_idx <- sig_idx[order(sig_logFC, decreasing = FALSE)[1:min(5, length(sig_idx))]]
+
+keep_idx <- unique(c(top_sig_idx, bottom_sig_idx))
+
+volc_KO_HIV$label_to_plot <- ifelse(seq_len(nrow(volc_KO_HIV)) %in% keep_idx,
+                                volc_KO_HIV$plot_label,
+                                NA_character_)
+```
+
+```{r}
+f4A <- ggplot(volc_KO_HIV, aes(x = logFC, y = neglog10q)) +
+    geom_point(aes(color = direction), alpha = 0.7) +
+    
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    
+# Left side labels
+geom_text_repel(
+  data = subset(volc_KO_HIV, !is.na(label_to_plot) & logFC < 0),
+  aes(label = label_to_plot),
+  size = 3,
+  nudge_x = -0.2,
+  hjust = 1,
+  direction = "y",
+  force = 3,
+  force_pull = 0.2,
+  max.overlaps = Inf,
+  segment.color = "grey50",
+  min.segment.length = 0.1
+) +
+
+# Right side labels
+geom_text_repel(
+  data = subset(volc_KO_HIV, !is.na(label_to_plot) & logFC > 0),
+  aes(label = label_to_plot),
+  size = 3,
+  nudge_x = 0.2,
+  hjust = 0,
+  direction = "y",
+  force = 3,
+  force_pull = 0.2,
+  max.overlaps = Inf,
+  segment.color = "grey50",
+  min.segment.length = 0.1
+) +
+    
+    scale_color_manual(values = c("Down" = "blue", "n.s." = "grey70", "Up" = "red")) +
+    
+    theme_bw() +
+    labs(
+        x = "Log Fold Change",
+        y = "-log10(q-value)",
+        color = "Direction",
+        title = "HIV infection\n(prePEP and HIV+ lowCD4 preART)"
+    ) +
+    theme(legend.position = "none",
+          plot.title = element_text(size = 10, hjust = 0.5))
+f4A
+```
+
+
+### Short-term PEP exposure (Figure 5C, Supplementary Table 8)
+
+```{r}
+tse_KO_ART <- KO_tse[, colData(KO_tse)$group %in% c("prePEP_HIV-", "postPEP_HIV-")]
+colData(tse_KO_ART)$group = factor(colData(tse_KO_ART)$group, levels = c("prePEP_HIV-", "postPEP_HIV-"))
+# Run ANCOMBC2
+results_KO_ART <- ancombc2(tse_KO_ART, fix_formula = "group")
+KO_res_prim_ART <- results_KO_ART$res |>
+    dplyr::left_join(KO_table[, c("KO", "description")], by = c("taxon" = "KO")) |>
+    dplyr::relocate(taxon, description) |> 
+    dplyr::rename(KO = taxon)
+# write_tsv(KO_res_prim_ART, "tables/ko_pep_exposure.tsv")
+```
+
+```{r}
+KO_res_prim_ART |>
+  filter(`q_grouppostPEP_HIV-` < 0.05, abs(`lfc_grouppostPEP_HIV-`) >= 2) |>
+  mutate(KO, description, log_fold_change = `lfc_grouppostPEP_HIV-`,
+            q_value = `q_grouppostPEP_HIV-`, .keep = "none") |>
+  arrange(q_value)
+```
+
+#### Volcano plot
+
+```{r}
+KO_res_prim_ART$plot_label <- mapply(make_ko_label, KO_res_prim_ART$KO, KO_res_prim_ART$description)
+```
+
+```{r}
+volc_KO_ART <- KO_res_prim_ART |>
+  mutate(
+    logFC = `lfc_grouppostPEP_HIV-`,
+    qval  = `q_grouppostPEP_HIV-`,
+    neglog10q = -log10(qval),
+    direction = case_when(
+      qval < 0.05 & logFC > 0 ~ "Up",
+      qval < 0.05 & logFC < 0 ~ "Down",
+      TRUE ~ "n.s."
+    )
+  )
+```
+
+```{r}
+f4C <- ggplot(volc_KO_ART, aes(x = logFC, y = neglog10q)) +
+    geom_point(aes(color = direction), alpha = 0.7) +
+    
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    
+    geom_text_repel(
+        data = subset(volc_KO_ART, qval < 0.05),
+        aes(label = plot_label),
+        size = 3,
+        max.overlaps = Inf,
+        force = 2,
+        force_pull = 0.5,
+        segment.color = "grey50",
+        segment.size = 0.3,
+        box.padding = 0.4,
+        point.padding = 0.2,
+        lineheight = 0.75
+    ) +
+    
+    scale_color_manual(values = c("Down" = "blue", "n.s." = "grey70", "Up" = "red")) +
+    
+    theme_bw() +
+    labs(
+        x = "Log Fold Change",
+        y = "-log10(q-value)",
+        color = "Direction",
+        title = "PEP exposure\n(prePEP and postPEP)"
+    ) +
+    theme(legend.position = "none",
+          plot.title = element_text(size = 10, hjust = 0.5))
+f4C
+```
+
+### Immune status (Figure 5B, Supplementary Table 6)
+
+```{r}
+tse_KO_immuno <- KO_tse[, colData(KO_tse)$group %in% c("shortART_HIV+", "longART_HIV+")]
+colData(tse_KO_immuno)$group = factor(colData(tse_KO_immuno)$group, levels = c("shortART_HIV+", "longART_HIV+"))
+# Run ANCOMBC2
+results_KO_immuno <- ancombc2(tse_KO_immuno, fix_formula = "group")
+KO_res_prim_immuno <- results_KO_immuno$res |>
+    dplyr::left_join(KO_table[, c("KO", "description")], by = c("taxon" = "KO")) |>
+    dplyr::relocate(taxon, description) |> 
+    dplyr::rename(KO = taxon)
+# write_tsv(KO_res_prim_immuno, "tables/ko_immune_status.tsv")
+```
+
+```{r}
+KO_res_prim_immuno |>
+  filter(`q_grouplongART_HIV+` < 0.05, abs(`lfc_grouplongART_HIV+`) >= 2) |>
+  mutate(KO, description, log_fold_change = `lfc_grouplongART_HIV+`,
+            q_value = `q_grouplongART_HIV+`, .keep = "none") |>
+  arrange(q_value)
+```
+
+#### Volcano plot
+
+```{r}
+KO_res_prim_immuno$plot_label <- mapply(make_ko_label, KO_res_prim_immuno$KO, KO_res_prim_immuno$description)
+```
+
+```{r}
+volc_KO_immuno <- KO_res_prim_immuno |>
+  mutate(
+    logFC = `lfc_grouplongART_HIV+`,
+    qval  = `q_grouplongART_HIV+`,
+    neglog10q = -log10(qval),
+    direction = case_when(
+      qval < 0.05 & logFC > 0 ~ "Up",
+      qval < 0.05 & logFC < 0 ~ "Down",
+      TRUE ~ "n.s."
+    )
+  )
+```
+
+```{r}
+f4B <- ggplot(volc_KO_immuno, aes(x = logFC, y = neglog10q)) +
+    geom_point(aes(color = direction), alpha = 0.7) +
+    
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    
+    geom_text_repel(
+        data = subset(volc_KO_immuno, qval < 0.05),
+        aes(label = plot_label),
+        size = 3,
+        max.overlaps = Inf,
+        force = 2,
+        force_pull = 0.5,
+        segment.color = "grey50",
+        segment.size = 0.3,
+        box.padding = 0.4,
+        point.padding = 0.2,
+        lineheight = 0.75
+    ) +
+    
+    scale_color_manual(values = c("Down" = "blue", "n.s." = "grey70", "Up" = "red")) +
+    
+    theme_bw() +
+    labs(
+        x = "Log Fold Change",
+        y = "-log10(q-value)",
+        color = "Direction",
+        title = "Immune status\n(HIV+ lowCD4 postART and\nHIV+ highCD4 postART) "
+    ) +
+    theme(legend.position = "none",
+          plot.title = element_text(size = 10, hjust = 0.5))
+f4B
+```
+
+## Enzymes (EC numbers)
+
+Build a TreeSummarizedExperiment:
+
+```{r}
+# Read abundance table
+EC_table <- read_tsv("data/picrust2_ec_abundance.tsv") |> 
+    dplyr::rename(EC = `function`)
+# Create microbial count table
+EC_mat <- as.matrix(EC_table[, c(-1, -2)])
+rownames(EC_mat) <- EC_table$EC
+EC_assays <- SimpleList(counts = EC_mat)
+```
+
+```{r}
+# Create metadata table
+smd <- align_metadata(EC_mat, metadata)
+```
+
+Create TSE:
+
+```{r}
+EC_tse <- TreeSummarizedExperiment(assays = EC_assays,
+                                   colData = smd,
+                                   rowData = NULL)
+```
+
+### HIV status (Figure 5D, Supplementary Table 5)
+
+Create tse by filtering previous tse:
+
+```{r}
+# QUESTION: Differences between HIV infection status
+EC_tse_HIV <- EC_tse[, colData(EC_tse)$group %in% c("prePEP_HIV-", "naive_HIV+")]
+colData(EC_tse_HIV)$group = factor(colData(EC_tse_HIV)$group, levels = c("prePEP_HIV-", "naive_HIV+"))
+# Run ANCOMBC2
+EC_results_HIV <- ancombc2(EC_tse_HIV, fix_formula = "group")
+EC_res_prim_HIV <- EC_results_HIV$res
+EC_res_prim_HIV <- EC_res_prim_HIV |>
+    dplyr::left_join(EC_table[, c("EC", "description")], by = c("taxon" = "EC")) |>
+    dplyr::relocate(taxon, description) |> 
+    dplyr::rename(EC = taxon)
+# write_tsv(EC_res_prim_HIV, "tables/ec_hiv_status.tsv")
+```
+
+The concise table below shows the significant EC terms with $|LFC| \geq 2$. The optional TSV export retains the complete ANCOM-BC2 result, including terms with q-values above 0.05.
+
+```{r}
+EC_res_prim_HIV |>
+  filter(`q_groupnaive_HIV+` < 0.05, abs(`lfc_groupnaive_HIV+`) >= 2) |>
+  mutate(EC, description, log_fold_change = `lfc_groupnaive_HIV+`,
+            q_value = `q_groupnaive_HIV+`, .keep = "none") |>
+  arrange(q_value)
+```
+
+```{r}
+volc_EC_HIV <- EC_res_prim_HIV |>
+  mutate(
+    logFC = `lfc_groupnaive_HIV+`,
+    qval  = `q_groupnaive_HIV+`,
+    neglog10q = -log10(qval),
+    direction = case_when(
+      qval < 0.05 & logFC > 0 ~ "Up",
+      qval < 0.05 & logFC < 0 ~ "Down",
+      TRUE ~ "n.s."
+    )
+  )
+
+# Filter because there are too many
+# Get top 10 and bottom 10 indices
+sig_idx <- which(volc_EC_HIV$qval < 0.05)
+
+sig_logFC <- volc_EC_HIV$logFC[sig_idx]
+
+top_sig_idx <- sig_idx[order(sig_logFC, decreasing = TRUE)[1:min(5, length(sig_idx))]]
+bottom_sig_idx <- sig_idx[order(sig_logFC, decreasing = FALSE)[1:min(5, length(sig_idx))]]
+
+keep_idx <- unique(c(top_sig_idx, bottom_sig_idx))
+
+volc_EC_HIV$label_to_plot <- ifelse(seq_len(nrow(volc_EC_HIV)) %in% keep_idx,
+                                volc_EC_HIV$EC,
+                                NA_character_)
+```
+
+```{r}
+f4D <- ggplot(volc_EC_HIV, aes(x = logFC, y = neglog10q)) +
+    geom_point(aes(color = direction), alpha = 0.7) +
+    
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    # Left side labels
+geom_text_repel(
+  data = subset(volc_EC_HIV, logFC < 0),
+  aes(label = gsub("EC:", "", label_to_plot)),
+  size = 3,
+  nudge_x = -0.2,
+  hjust = 1,
+  direction = "y",
+  force = 3,
+  force_pull = 0.2,
+  max.overlaps = Inf,
+  segment.color = "grey50",
+  min.segment.length = 0.1
+) +
+
+# Right side labels
+geom_text_repel(
+  data = subset(volc_EC_HIV, logFC > 0),
+  aes(label = gsub("EC:", "", label_to_plot)),
+  size = 3,
+  nudge_x = 0.2,
+  hjust = 0,
+  direction = "y",
+  force = 3,
+  force_pull = 0.2,
+  max.overlaps = Inf,
+  segment.color = "grey50",
+  min.segment.length = 0.1
+) +
+    scale_color_manual(values = c("Down" = "blue", "n.s." = "grey70", "Up" = "red")) +
+    
+    theme_bw() +
+    labs(
+        x = "Log Fold Change",
+        y = "-log10(q-value)",
+        color = "Direction",
+        title = "HIV infection\n(prePEP and HIV+ lowCD4 preART)"
+    ) +
+    theme(legend.position = "none",
+          plot.title = element_text(size = 10, hjust = 0.5))
+f4D
+```
+
+### Short-term PEP exposure (Figure 5F, Supplementary Table 9)
+
+```{r}
+tse_EC_ART <- EC_tse[, colData(EC_tse)$group %in% c("prePEP_HIV-", "postPEP_HIV-")]
+colData(tse_EC_ART)$group = factor(colData(tse_EC_ART)$group, levels = c("prePEP_HIV-", "postPEP_HIV-"))
+# Run ANCOMBC2
+results_EC_ART <- ancombc2(tse_EC_ART, fix_formula = "group")
+EC_res_prim_ART <- results_EC_ART$res |>
+    dplyr::left_join(EC_table[, c("EC", "description")], by = c("taxon" = "EC")) |>
+    dplyr::relocate(taxon, description) |> 
+    dplyr::rename(EC = taxon)
+# write_tsv(EC_res_prim_ART, "tables/ec_pep_exposure.tsv")
+```
+
+```{r}
+EC_res_prim_ART |>
+  filter(`q_grouppostPEP_HIV-` < 0.05, abs(`lfc_grouppostPEP_HIV-`) >= 2) |>
+  mutate(EC, description, log_fold_change = `lfc_grouppostPEP_HIV-`,
+            q_value = `q_grouppostPEP_HIV-`, .keep = "none") |>
+  arrange(q_value)
+```
+
+```{r}
+volc_EC_ART <- EC_res_prim_ART |>
+  mutate(
+    logFC = `lfc_grouppostPEP_HIV-`,
+    qval  = `q_grouppostPEP_HIV-`,
+    neglog10q = -log10(qval),
+    direction = case_when(
+      qval < 0.05 & logFC > 0 ~ "Up",
+      qval < 0.05 & logFC < 0 ~ "Down",
+      TRUE ~ "n.s."
+    )
+  )
+```
+
+```{r}
+f4F <- ggplot(volc_EC_ART, aes(x = logFC, y = neglog10q)) +
+    geom_point(aes(color = direction), alpha = 0.7) +
+    
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    
+    geom_text_repel(
+        data = subset(volc_EC_ART, qval < 0.05),
+        aes(label = gsub("EC:", "", EC)),
+        size = 3,
+        max.overlaps = Inf,
+        force = 2,
+        force_pull = 0.5,
+        segment.color = "grey50",
+        segment.size = 0.3,
+        box.padding = 0.4,
+        point.padding = 0.2,
+        lineheight = 0.75
+    ) +
+    
+    scale_color_manual(values = c("Down" = "blue", "n.s." = "grey70", "Up" = "red")) +
+    
+    theme_bw() +
+    labs(
+        x = "Log Fold Change",
+        y = "-log10(q-value)",
+        color = "Direction",
+        title = "PEP exposure\n(prePEP and postPEP)"
+    ) +
+    theme(legend.position = "none",
+          plot.title = element_text(size = 10, hjust = 0.5))
+f4F
+```
+
+### Immune status (Figure 5E, Supplementary Table 7)
+
+```{r}
+tse_EC_immuno <- EC_tse[, colData(EC_tse)$group %in% c("shortART_HIV+", "longART_HIV+")]
+colData(tse_EC_immuno)$group = factor(colData(tse_EC_immuno)$group, levels = c("shortART_HIV+", "longART_HIV+"))
+# Run ANCOMBC2
+results_EC_immuno <- ancombc2(tse_EC_immuno, fix_formula = "group")
+EC_res_prim_immuno <- results_EC_immuno$res |>
+    dplyr::left_join(EC_table[, c("EC", "description")], by = c("taxon" = "EC")) |>
+    dplyr::relocate(taxon, description) |> 
+    dplyr::rename(EC = taxon)
+# write_tsv(EC_res_prim_immuno, "tables/ec_immune_status.tsv")
+```
+
+```{r}
+EC_res_prim_immuno |>
+  filter(`q_grouplongART_HIV+` < 0.05, abs(`lfc_grouplongART_HIV+`) >= 2) |>
+  mutate(EC, description, log_fold_change = `lfc_grouplongART_HIV+`,
+            q_value = `q_grouplongART_HIV+`, .keep = "none") |>
+  arrange(q_value)
+```
+
+```{r}
+volc_EC_immuno <- EC_res_prim_immuno |> 
+  mutate(
+    logFC = `lfc_grouplongART_HIV+`,
+    qval  = `q_grouplongART_HIV+`,
+    neglog10q = -log10(qval),
+    direction = case_when(
+      qval < 0.05 & logFC > 0 ~ "Up",
+      qval < 0.05 & logFC < 0 ~ "Down",
+      TRUE ~ "n.s."
+    )
+  )
+```
+
+```{r}
+f4E <- ggplot(volc_EC_immuno, aes(x = logFC, y = neglog10q)) +
+    geom_point(aes(color = direction), alpha = 0.7) +
+    
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    
+    geom_text_repel(
+        data = subset(volc_EC_immuno, qval < 0.05),
+        aes(label = gsub("EC:", "", EC)),
+        size = 3,
+        max.overlaps = Inf,
+        force = 2,
+        force_pull = 0.5,
+        segment.color = "grey50",
+        segment.size = 0.3,
+        box.padding = 0.4,
+        point.padding = 0.2,
+        lineheight = 0.75
+    ) +
+    
+    scale_color_manual(values = c("Down" = "blue", "n.s." = "grey70", "Up" = "red")) +
+    
+    theme_bw() +
+    labs(
+        x = "Log Fold Change",
+        y = "-log10(q-value)",
+        color = "Direction",
+        title = "Immune status\n(HIV+ lowCD4 postART and\nHIV+ highCD4 postART) "
+    ) +
+    theme(legend.position = "none",
+          plot.title = element_text(size = 10, hjust = 0.5))
+f4E
+```
+
+## Final figure (differential functions analysis)
+
+```{r}
+# svg("figures/differential_functions.svg", width = 10.5, height = 7.5)
+
+y_lim <- ggplot_build(f4D)$layout$panel_params[[1]]$y.range
+f4Ay <- f4A + coord_cartesian(ylim = y_lim)
+f4By <- f4B + coord_cartesian(ylim = y_lim)
+f4Cy <- f4C + coord_cartesian(ylim = y_lim)
+f4Dy <- f4D + coord_cartesian(ylim = y_lim)
+f4Ey <- f4E + coord_cartesian(ylim = y_lim)
+f4Fy <- f4F + coord_cartesian(ylim = y_lim)
+
+ggpubr::ggarrange(
+    f4Ay, f4By, f4Cy, f4Dy, f4Ey, f4Fy,
+    ncol = 3, nrow = 2,
+    labels = c("A", "B", "C", "D", "E", "F"),
+    common.legend = TRUE,
+    legend = "bottom"
+)
+# dev.off()
+```
+
+# Reproducibility information
+
+The software versions used to render the analysis are reported below.
+
+```{r}
+sessionInfo()
+```
